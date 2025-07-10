@@ -20,8 +20,9 @@ def crop_white_border(image_path, output_path, tolerance=250):
     cropped.save(output_path)
     print(f"Cropped image saved to: {output_path}")
 
-# Example usage
-crop_white_border(
-    '/home/pranil/workspace/python_projects/smartcity_model/datasets/kathmandu_satellite_images_tiles/output_1.png',
-    '/home/pranil/workspace/python_projects/smartcity_model/src/output_1_cropped.png'
-)
+for i in range(868):
+    crop_white_border(
+        f'/home/pranil/workspace/python_projects/smartcity_model/datasets/kathmandu_satellite_images_tiles/output_{i + 1}.png',
+        f'/home/pranil/workspace/python_projects/smartcity_model/datasets/kathmandu_satellite_cropped_image_tiles/output_{i + 1}_cropped.png'
+    )
+
