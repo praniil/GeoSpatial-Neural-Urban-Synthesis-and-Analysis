@@ -1,2 +1,5 @@
 /venv
 /datasets
+/src/finetuning_segformer/segformer_logs
+/src/finetuning_segformer/segformer_logs_kfold
+/src/finetuning_segformer/wandb
