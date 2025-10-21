@@ -7,7 +7,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader, Subset
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
-from transformers import SegformerForSemanticSegmentation, SegformerFeatureExtractor
+from transformers import SegformerForSemanticSegmentation, SegformerImageProcessor
 import torch.nn.functional as F
 from sklearn.model_selection import KFold
 import wandb
@@ -15,17 +15,17 @@ import wandb
 # CONFIGURATION
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 num_classes = 7
-batch_size = 2
+batch_size = 2            # Reduced for memory
 learning_rate = 5e-5
 num_epochs = 100
-image_size = 512
+image_size = 256          # Reduced from 512 for memory
 patience = 5
 num_folds = 5
 
-train_img_dir = "../../datasets/deepGlobe Land Cover Classification Dataset/train/split_image"
-train_mask_dir = "../../datasets/deepGlobe Land Cover Classification Dataset/train/split_label-mask"
+train_img_dir = "../../datasets/deepGlobe Land Cover Classification Dataset/total_dataset/image"
+train_mask_dir = "../../datasets/deepGlobe Land Cover Classification Dataset/total_dataset/label-mask"
 
-output_dir = "./segformer_logs_kfold"
+output_dir = "./segformer_kfold_output"
 os.makedirs(output_dir, exist_ok=True)
 checkpoint_dir = os.path.join(output_dir, "checkpoints")
 os.makedirs(checkpoint_dir, exist_ok=True)
@@ -68,13 +68,13 @@ train_tf = A.Compose([
 ])
 
 # FEATURE EXTRACTOR
-feature_extractor = SegformerFeatureExtractor.from_pretrained(
+feature_extractor = SegformerImageProcessor.from_pretrained(
     "nvidia/segformer-b2-finetuned-ade-512-512"
 )
 
 # METRICS
 def mean_iou(pred, target, num_classes):
-    pred = torch.argmax(pred, dim=1)  # B,H,W
+    pred = torch.argmax(pred, dim=1)
     target_resized = F.interpolate(target.unsqueeze(1).float(), size=pred.shape[1:], mode="nearest").squeeze(1).long()
     ious = []
     for cls in range(num_classes):
@@ -87,14 +87,12 @@ def mean_iou(pred, target, num_classes):
         ious.append(intersection / union)
     return torch.mean(torch.tensor(ious)) if ious else torch.tensor(0.0)
 
-# ==============================
 # K-FOLD CROSS VALIDATION
-# ==============================
 dataset = SegDataset(train_img_dir, train_mask_dir, feature_extractor, train_tf)
 all_indices = np.arange(len(dataset))
 kf = KFold(n_splits=num_folds, shuffle=True, random_state=42)
 
-# Initialize CSV logging
+# CSV logging
 with open(log_file, "w", newline="") as f:
     writer = csv.writer(f)
     writer.writerow(["fold", "epoch", "train_loss", "train_iou", "val_loss", "val_iou"])
@@ -104,13 +102,16 @@ fold_metrics = []
 for fold, (train_idx, val_idx) in enumerate(kf.split(all_indices), 1):
     print(f"\n========== Fold {fold}/{num_folds} ==========")
 
-    # Create subsets and dataloaders
+    # Free GPU memory between folds
+    torch.cuda.empty_cache()
+
+    # Dataloaders
     train_subset = Subset(dataset, train_idx)
     val_subset = Subset(dataset, val_idx)
     train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True, num_workers=2)
     val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False, num_workers=2)
 
-    # Initialize model
+    # Model
     model = SegformerForSemanticSegmentation.from_pretrained(
         "nvidia/segformer-b2-finetuned-ade-512-512",
         num_labels=num_classes,
@@ -119,8 +120,9 @@ for fold, (train_idx, val_idx) in enumerate(kf.split(all_indices), 1):
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
     criterion = torch.nn.CrossEntropyLoss()
+    scaler = torch.cuda.amp.GradScaler()  # Mixed precision
 
-    # Initialize WandB for this fold
+    # WandB
     wandb.init(project="segformer-kfold", name=f"fold_{fold}", reinit=True)
     wandb.config.update({
         "fold": fold,
@@ -143,12 +145,15 @@ for fold, (train_idx, val_idx) in enumerate(kf.split(all_indices), 1):
 
         for imgs, masks in tqdm(train_loader, desc=f"Training Fold {fold} Epoch {epoch+1}"):
             imgs, masks = imgs.to(device), masks.to(device)
-            outputs = model(pixel_values=imgs, labels=masks)
-            loss = outputs.loss
-
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+
+            with torch.cuda.amp.autocast():
+                outputs = model(pixel_values=imgs, labels=masks)
+                loss = outputs.loss
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             total_train_loss += loss.item()
             total_train_iou += mean_iou(outputs.logits.detach(), masks, num_classes).item()
@@ -164,8 +169,9 @@ for fold, (train_idx, val_idx) in enumerate(kf.split(all_indices), 1):
         with torch.no_grad():
             for imgs, masks in tqdm(val_loader, desc=f"Validation Fold {fold}"):
                 imgs, masks = imgs.to(device), masks.to(device)
-                outputs = model(pixel_values=imgs, labels=masks)
-                loss = outputs.loss
+                with torch.cuda.amp.autocast():
+                    outputs = model(pixel_values=imgs, labels=masks)
+                    loss = outputs.loss
 
                 total_val_loss += loss.item()
                 total_val_iou += mean_iou(outputs.logits, masks, num_classes).item()
@@ -213,6 +219,7 @@ for fold, (train_idx, val_idx) in enumerate(kf.split(all_indices), 1):
 
     fold_metrics.append(best_val_iou)
     wandb.finish()
+    torch.cuda.empty_cache()
 
 # SUMMARY
 print("\n========== K-FOLD CROSS VALIDATION RESULTS ==========")
