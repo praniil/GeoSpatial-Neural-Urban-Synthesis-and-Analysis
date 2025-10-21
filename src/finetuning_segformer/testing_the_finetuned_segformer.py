@@ -8,7 +8,8 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 num_classes = 7
 
 # Load the image
-img_path = "../../datasets/deepGlobe Land Cover Classification Dataset/train/split_image/119_sat.jpg"
+# img_path = "../../datasets/deepGlobe Land Cover Classification Dataset/train/split_image/10452_sat.jpg"
+img_path = "../../datasets/test_dataset/kat_lal_bhak_tiles/output_789.png"
 image = Image.open(img_path).convert("RGB")
 
 # Load processor
@@ -22,7 +23,7 @@ model = SegformerForSemanticSegmentation.from_pretrained(
 ).to(device)
 
 # Load your fine-tuned weights
-checkpoint_path = "segformer_logs/segformer_finetuned_final.pth"
+checkpoint_path = "segformer_logs_kfold/checkpoints/best_model_fold5.pth"
 model.load_state_dict(torch.load(checkpoint_path, map_location=device))
 model.eval()
 
@@ -40,13 +41,13 @@ pred_mask = torch.argmax(logits.squeeze(), dim=0).cpu().numpy()
 
 # Color map
 colors = np.array([
-    [0, 0, 0],        # class 0
-    [128, 0, 0],      # class 1
-    [0, 128, 0],      # class 2
-    [128, 128, 0],    # class 3
-    [0, 0, 128],      # class 4
-    [128, 0, 128],    # class 5
-    [0, 128, 128],    # class 6
+    [0,255,255],        # class 0
+    [255,255,0],      # class 1
+    [255,0,255],      # class 2
+    [0,255,0],    # class 3
+    [0,0,255],      # class 4
+    [255,255,255],    # class 5
+    [0,0,0],    # class 6
 ], dtype=np.uint8)
 
 seg_image = colors[pred_mask]
