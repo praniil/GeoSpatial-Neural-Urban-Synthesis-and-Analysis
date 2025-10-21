@@ -1,32 +1,36 @@
 import os
+import csv
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from transformers import SegformerForSemanticSegmentation, SegformerFeatureExtractor
 import torch.nn.functional as F
+from sklearn.model_selection import KFold
+import wandb
 
 # CONFIGURATION
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 num_classes = 7
 batch_size = 2
 learning_rate = 5e-5
-num_epochs = 20
+num_epochs = 100
 image_size = 512
+patience = 5
+num_folds = 5
 
-# Folder structure
 train_img_dir = "../../datasets/deepGlobe Land Cover Classification Dataset/train/split_image"
 train_mask_dir = "../../datasets/deepGlobe Land Cover Classification Dataset/train/split_label-mask"
-val_img_dir = "../../datasets/deepGlobe Land Cover Classification Dataset/validation/image"
-val_mask_dir = "../../datasets/deepGlobe Land Cover Classification Dataset/validation/label-mask"
 
-output_dir = "./segformer_logs"
+output_dir = "./segformer_logs_kfold"
 os.makedirs(output_dir, exist_ok=True)
 checkpoint_dir = os.path.join(output_dir, "checkpoints")
 os.makedirs(checkpoint_dir, exist_ok=True)
+
+log_file = os.path.join(output_dir, "kfold_training_log.csv")
 
 # DATASET CLASS
 class SegDataset(Dataset):
@@ -51,7 +55,7 @@ class SegDataset(Dataset):
 
         encoded = self.feature_extractor(images=img, return_tensors="pt")
         pixel_values = encoded["pixel_values"].squeeze()
-        return pixel_values, mask.clone().long()  # fixed warning
+        return pixel_values, mask.clone().long()
 
 # TRANSFORMS
 train_tf = A.Compose([
@@ -63,38 +67,15 @@ train_tf = A.Compose([
     ToTensorV2()
 ])
 
-val_tf = A.Compose([
-    A.Resize(image_size, image_size),
-    ToTensorV2()
-])
-
-# DATALOADERS
+# FEATURE EXTRACTOR
 feature_extractor = SegformerFeatureExtractor.from_pretrained(
     "nvidia/segformer-b2-finetuned-ade-512-512"
 )
 
-train_dataset = SegDataset(train_img_dir, train_mask_dir, feature_extractor, train_tf)
-val_dataset = SegDataset(val_img_dir, val_mask_dir, feature_extractor, val_tf)
-
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
-val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
-
-# MODEL SETUP
-model = SegformerForSemanticSegmentation.from_pretrained(
-    "nvidia/segformer-b2-finetuned-ade-512-512",
-    num_labels=num_classes,
-    ignore_mismatched_sizes=True
-).to(device)
-
-optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
-criterion = torch.nn.CrossEntropyLoss()
-
 # METRICS
 def mean_iou(pred, target, num_classes):
     pred = torch.argmax(pred, dim=1)  # B,H,W
-    # Resize target to match pred size
     target_resized = F.interpolate(target.unsqueeze(1).float(), size=pred.shape[1:], mode="nearest").squeeze(1).long()
-
     ious = []
     for cls in range(num_classes):
         pred_cls = (pred == cls)
@@ -105,55 +86,136 @@ def mean_iou(pred, target, num_classes):
             continue
         ious.append(intersection / union)
     return torch.mean(torch.tensor(ious)) if ious else torch.tensor(0.0)
-# TRAINING LOOP
-for epoch in range(num_epochs):
-    model.train()
-    total_train_loss = 0.0
-    total_train_iou = 0.0
 
-    for imgs, masks in tqdm(train_loader, desc=f"Training Epoch {epoch+1}/{num_epochs}"):
-        imgs, masks = imgs.to(device), masks.to(device)
-        outputs = model(pixel_values=imgs, labels=masks)
-        loss = outputs.loss
+# ==============================
+# K-FOLD CROSS VALIDATION
+# ==============================
+dataset = SegDataset(train_img_dir, train_mask_dir, feature_extractor, train_tf)
+all_indices = np.arange(len(dataset))
+kf = KFold(n_splits=num_folds, shuffle=True, random_state=42)
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+# Initialize CSV logging
+with open(log_file, "w", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerow(["fold", "epoch", "train_loss", "train_iou", "val_loss", "val_iou"])
 
-        total_train_loss += loss.item()
-        total_train_iou += mean_iou(outputs.logits.detach(), masks, num_classes).item()
+fold_metrics = []
 
-    avg_train_loss = total_train_loss / len(train_loader)
-    avg_train_iou = total_train_iou / len(train_loader)
+for fold, (train_idx, val_idx) in enumerate(kf.split(all_indices), 1):
+    print(f"\n========== Fold {fold}/{num_folds} ==========")
 
-    # VALIDATION
-    model.eval()
-    total_val_loss = 0.0
-    total_val_iou = 0.0
+    # Create subsets and dataloaders
+    train_subset = Subset(dataset, train_idx)
+    val_subset = Subset(dataset, val_idx)
+    train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True, num_workers=2)
+    val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False, num_workers=2)
 
-    with torch.no_grad():
-        for imgs, masks in tqdm(val_loader, desc="Validation"):
+    # Initialize model
+    model = SegformerForSemanticSegmentation.from_pretrained(
+        "nvidia/segformer-b2-finetuned-ade-512-512",
+        num_labels=num_classes,
+        ignore_mismatched_sizes=True
+    ).to(device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
+    criterion = torch.nn.CrossEntropyLoss()
+
+    # Initialize WandB for this fold
+    wandb.init(project="segformer-kfold", name=f"fold_{fold}", reinit=True)
+    wandb.config.update({
+        "fold": fold,
+        "num_classes": num_classes,
+        "batch_size": batch_size,
+        "learning_rate": learning_rate,
+        "num_epochs": num_epochs,
+        "image_size": image_size,
+        "patience": patience
+    })
+
+    best_val_iou = 0.0
+    no_improve_epochs = 0
+
+    for epoch in range(num_epochs):
+        # TRAINING
+        model.train()
+        total_train_loss = 0.0
+        total_train_iou = 0.0
+
+        for imgs, masks in tqdm(train_loader, desc=f"Training Fold {fold} Epoch {epoch+1}"):
             imgs, masks = imgs.to(device), masks.to(device)
             outputs = model(pixel_values=imgs, labels=masks)
             loss = outputs.loss
 
-            total_val_loss += loss.item()
-            total_val_iou += mean_iou(outputs.logits, masks, num_classes).item()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-    avg_val_loss = total_val_loss / len(val_loader)
-    avg_val_iou = total_val_iou / len(val_loader)
+            total_train_loss += loss.item()
+            total_train_iou += mean_iou(outputs.logits.detach(), masks, num_classes).item()
 
-  
-    # LOGGING + CHECKPOINT
-    print(f"\nEpoch [{epoch+1}/{num_epochs}]")
-    print(f"Train Loss: {avg_train_loss:.4f} | Train IoU: {avg_train_iou:.4f}")
-    print(f"Val Loss:   {avg_val_loss:.4f} | Val IoU:   {avg_val_iou:.4f}")
+        avg_train_loss = total_train_loss / len(train_loader)
+        avg_train_iou = total_train_iou / len(train_loader)
 
-    # Save checkpoint
-    ckpt_path = os.path.join(checkpoint_dir, f"epoch_{epoch+1}.pth")
-    torch.save(model.state_dict(), ckpt_path)
+        # VALIDATION
+        model.eval()
+        total_val_loss = 0.0
+        total_val_iou = 0.0
 
-# SAVE FINAL MODEL
-final_path = os.path.join(output_dir, "segformer_finetuned_final.pth")
-torch.save(model.state_dict(), final_path)
-print(f"\nTraining complete! Final model saved at: {final_path}")
+        with torch.no_grad():
+            for imgs, masks in tqdm(val_loader, desc=f"Validation Fold {fold}"):
+                imgs, masks = imgs.to(device), masks.to(device)
+                outputs = model(pixel_values=imgs, labels=masks)
+                loss = outputs.loss
+
+                total_val_loss += loss.item()
+                total_val_iou += mean_iou(outputs.logits, masks, num_classes).item()
+
+        avg_val_loss = total_val_loss / len(val_loader)
+        avg_val_iou = total_val_iou / len(val_loader)
+
+        # LOGGING
+        print(f"\nFold [{fold}] Epoch [{epoch+1}/{num_epochs}]")
+        print(f"Train Loss: {avg_train_loss:.4f} | Train IoU: {avg_train_iou:.4f}")
+        print(f"Val Loss:   {avg_val_loss:.4f} | Val IoU:   {avg_val_iou:.4f}")
+
+        wandb.log({
+            "Train Loss": avg_train_loss,
+            "Train IoU": avg_train_iou,
+            "Val Loss": avg_val_loss,
+            "Val IoU": avg_val_iou,
+            "Epoch": epoch + 1,
+            "Fold": fold
+        })
+
+        # CSV logging
+        with open(log_file, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([fold, epoch+1, avg_train_loss, avg_train_iou, avg_val_loss, avg_val_iou])
+
+        # Save checkpoint
+        ckpt_path = os.path.join(checkpoint_dir, f"fold{fold}_epoch{epoch+1}.pth")
+        torch.save(model.state_dict(), ckpt_path)
+
+        # Early stopping
+        if avg_val_iou > best_val_iou:
+            best_val_iou = avg_val_iou
+            no_improve_epochs = 0
+            best_model_path = os.path.join(checkpoint_dir, f"best_model_fold{fold}.pth")
+            torch.save(model.state_dict(), best_model_path)
+            print(f"New best model saved for fold {fold} at epoch {epoch+1} with Val IoU = {best_val_iou:.4f}")
+        else:
+            no_improve_epochs += 1
+            print(f"No improvement for {no_improve_epochs} epoch(s).")
+
+        if no_improve_epochs >= patience:
+            print(f"Early stopping triggered for fold {fold} at epoch {epoch+1}.")
+            break
+
+    fold_metrics.append(best_val_iou)
+    wandb.finish()
+
+# SUMMARY
+print("\n========== K-FOLD CROSS VALIDATION RESULTS ==========")
+for i, iou in enumerate(fold_metrics, 1):
+    print(f"Fold {i} Best Val IoU: {iou:.4f}")
+print(f"Mean Best Val IoU Across Folds: {np.mean(fold_metrics):.4f}")
