@@ -9,7 +9,7 @@ num_classes = 7
 
 # Load the image
 # img_path = "../../datasets/deepGlobe Land Cover Classification Dataset/train/split_image/10452_sat.jpg"
-img_path = "../../datasets/test_dataset/kat_lal_bhak_tiles/output_692.png"
+img_path = "../../datasets/test_dataset/kat_lal_bhak_tiles/output_812.png"
 image = Image.open(img_path).convert("RGB")
 
 # Load processor
@@ -24,7 +24,8 @@ model = SegformerForSemanticSegmentation.from_pretrained(
 
 # Load your fine-tuned weights
 # src/finetuning_segformer/segformer_after_regularization
-checkpoint_path = "segformer_after_regularization/checkpoints/best_model_fold2.pth"
+# src/finetuning_segformer/segformer_improved_unfreezed_ encoder/checkpoints/best_model_fold1.pth
+checkpoint_path = "segformer_improved_unfreezed_encoder_updated/checkpoints/best_model_fold1.pth"
 model.load_state_dict(torch.load(checkpoint_path, map_location=device))
 model.eval()
 
