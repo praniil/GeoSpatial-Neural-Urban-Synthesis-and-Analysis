@@ -17,18 +17,18 @@ import wandb
 # ==============================
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 num_classes = 7
-batch_size = 2           # small due to memory
+batch_size = 2          # small due to memory
 learning_rate = 5e-5
 num_epochs = 100
 image_size = 256
-patience = 7             # slightly higher patience
-num_folds = 5
+patience = 5             # slightly higher patience
+num_folds = 3
 accumulation_steps = 4
 
 train_img_dir = "../../datasets/deepGlobe Land Cover Classification Dataset/total_dataset/image"
 train_mask_dir = "../../datasets/deepGlobe Land Cover Classification Dataset/total_dataset/label-mask"
 
-output_dir = "./segformer_improved_unfreezed_ encoder"
+output_dir = "./segformer_improved_unfreezed_encoder_updated"
 os.makedirs(output_dir, exist_ok=True)
 checkpoint_dir = os.path.join(output_dir, "checkpoints")
 os.makedirs(checkpoint_dir, exist_ok=True)
@@ -144,7 +144,7 @@ for fold, (train_idx, val_idx) in enumerate(kf.split(all_indices), 1):
     scaler = torch.cuda.amp.GradScaler()
 
     # WandB
-    wandb.init(project="segformer-kfold-improved", name=f"fold_{fold}", reinit=True)
+    wandb.init(project="segformer-kfold-improved-updated", name=f"fold_{fold}", reinit=True)
     wandb.config.update({
         "fold": fold,
         "num_classes": num_classes,
