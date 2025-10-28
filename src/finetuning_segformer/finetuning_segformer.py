@@ -17,26 +17,26 @@ import wandb
 # ==============================
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 num_classes = 7
-batch_size = 2            # Reduced for memory
+batch_size = 2           # small due to memory
 learning_rate = 5e-5
 num_epochs = 100
-image_size = 256          # Reduced from 512 for memory
-patience = 5
+image_size = 256
+patience = 7             # slightly higher patience
 num_folds = 5
-accumulation_steps = 4    # Gradient accumulation to simulate larger batch size
+accumulation_steps = 4
 
 train_img_dir = "../../datasets/deepGlobe Land Cover Classification Dataset/total_dataset/image"
 train_mask_dir = "../../datasets/deepGlobe Land Cover Classification Dataset/total_dataset/label-mask"
 
-output_dir = "./segformer_after_regularization"
+output_dir = "./segformer_improved_unfreezed_ encoder"
 os.makedirs(output_dir, exist_ok=True)
 checkpoint_dir = os.path.join(output_dir, "checkpoints")
 os.makedirs(checkpoint_dir, exist_ok=True)
-
 log_file = os.path.join(output_dir, "kfold_training_log.csv")
 
-
-# DATASET CLASS
+# ==============================
+# DATASET
+# ==============================
 class SegDataset(Dataset):
     def __init__(self, img_dir, mask_dir, feature_extractor, transforms=None):
         self.img_dir = img_dir
@@ -61,25 +61,28 @@ class SegDataset(Dataset):
         pixel_values = encoded["pixel_values"].squeeze()
         return pixel_values, mask.clone().long()
 
-# STRONGER AUGMENTATIONS (changed)
+# ==============================
+# AUGMENTATIONS (moderate)
+# ==============================
 train_tf = A.Compose([
     A.HorizontalFlip(p=0.5),
     A.VerticalFlip(p=0.5),
     A.RandomRotate90(p=0.5),
     A.ColorJitter(0.2, 0.2, 0.2, 0.1, p=0.5),
-    A.RandomGamma(p=0.5),                     # Added gamma adjustment
-    A.ElasticTransform(alpha=1, sigma=50, p=0.5),  # Added elastic transform
-    A.GridDistortion(p=0.5),                  # Added grid distortion
     A.Resize(image_size, image_size),
     ToTensorV2()
 ])
 
+# ==============================
 # FEATURE EXTRACTOR
+# ==============================
 feature_extractor = SegformerImageProcessor.from_pretrained(
     "nvidia/segformer-b2-finetuned-ade-512-512"
 )
 
+# ==============================
 # METRICS
+# ==============================
 def mean_iou(pred, target, num_classes):
     pred = torch.argmax(pred, dim=1)
     target_resized = F.interpolate(target.unsqueeze(1).float(), size=pred.shape[1:], mode="nearest").squeeze(1).long()
@@ -94,7 +97,9 @@ def mean_iou(pred, target, num_classes):
         ious.append(intersection / union)
     return torch.mean(torch.tensor(ious)) if ious else torch.tensor(0.0)
 
-# K-FOLD CROSS VALIDATION
+# ==============================
+# DATASET AND K-FOLD
+# ==============================
 dataset = SegDataset(train_img_dir, train_mask_dir, feature_extractor, train_tf)
 all_indices = np.arange(len(dataset))
 kf = KFold(n_splits=num_folds, shuffle=True, random_state=42)
@@ -106,6 +111,9 @@ with open(log_file, "w", newline="") as f:
 
 fold_metrics = []
 
+# ==============================
+# K-FOLD TRAINING
+# ==============================
 for fold, (train_idx, val_idx) in enumerate(kf.split(all_indices), 1):
     print(f"\n========== Fold {fold}/{num_folds} ==========")
     torch.cuda.empty_cache()
@@ -123,22 +131,20 @@ for fold, (train_idx, val_idx) in enumerate(kf.split(all_indices), 1):
         ignore_mismatched_sizes=True
     ).to(device)
 
-    # FREEZE ENCODER (changed)
-    # Prevent overfitting small dataset by freezing pretrained encoder initially
-    # Freezing encoder to prevent overfitting on small dataset
+    # Gradual unfreeze: freeze all encoder first
     for param in model.segformer.encoder.parameters():
         param.requires_grad = False
 
-    # ADD DROPOUT TO DECODER (changed)
+    # Add decoder dropout
     if hasattr(model.decode_head, 'dropout'):
         model.decode_head.dropout = torch.nn.Dropout2d(p=0.2)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
-    criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.1)  # Label smoothing added to improve generalization
+    criterion = torch.nn.CrossEntropyLoss()  # no label smoothing initially
     scaler = torch.cuda.amp.GradScaler()
 
     # WandB
-    wandb.init(project="segformer-kfold-after-regularization", name=f"fold_{fold}", reinit=True)
+    wandb.init(project="segformer-kfold-improved", name=f"fold_{fold}", reinit=True)
     wandb.config.update({
         "fold": fold,
         "num_classes": num_classes,
@@ -153,6 +159,12 @@ for fold, (train_idx, val_idx) in enumerate(kf.split(all_indices), 1):
     no_improve_epochs = 0
 
     for epoch in range(num_epochs):
+        # Unfreeze encoder after 5 epochs
+        if epoch == 5:
+            for param in model.segformer.encoder.parameters():
+                param.requires_grad = True
+            print("Encoder unfrozen for fine-tuning.")
+
         # TRAINING
         model.train()
         total_train_loss = 0.0
@@ -163,11 +175,11 @@ for fold, (train_idx, val_idx) in enumerate(kf.split(all_indices), 1):
 
             with torch.cuda.amp.autocast():
                 outputs = model(pixel_values=imgs, labels=masks)
-                loss = outputs.loss / accumulation_steps   # Gradient accumulation
+                loss = outputs.loss / accumulation_steps
 
             scaler.scale(loss).backward()
 
-            if (step + 1) % accumulation_steps == 0:
+            if (step + 1) % accumulation_steps == 0 or (step + 1) == len(train_loader):
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
@@ -237,7 +249,9 @@ for fold, (train_idx, val_idx) in enumerate(kf.split(all_indices), 1):
     wandb.finish()
     torch.cuda.empty_cache()
 
+# ==============================
 # SUMMARY
+# ==============================
 print("\n========== K-FOLD CROSS VALIDATION RESULTS ==========")
 for i, iou in enumerate(fold_metrics, 1):
     print(f"Fold {i} Best Val IoU: {iou:.4f}")
