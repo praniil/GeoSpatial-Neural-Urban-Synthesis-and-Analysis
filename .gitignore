@@ -5,3 +5,5 @@
 /src/finetuning_segformer/wandb
 /src/finetuning_segformer/segformer_kfold_output
 /src/finetuning_segformer/segformer_after_regularization
+/src/finetuning_segformer/segformer_improved_unfreezed_ encoder
+/src/finetuning_segformer/segformer_improved_unfreezed_encoder_updated
