@@ -4,7 +4,7 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 import torch
-from torch.utils.data import Dataset, DataLoader, Subset
+from torch.utils.data import Dataset, DataLoader, Subset, WeightedRandomSampler
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from transformers import SegformerForSemanticSegmentation, SegformerImageProcessor
@@ -17,18 +17,19 @@ import wandb
 # ==============================
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 num_classes = 7
-batch_size = 2          # small due to memory
+batch_size = 2
 learning_rate = 5e-5
 num_epochs = 100
 image_size = 256
-patience = 5             # slightly higher patience
-num_folds = 3
+patience = 5
+num_folds = 3  # Reduced folds for small dataset
 accumulation_steps = 4
+river_class_index = 4  
 
 train_img_dir = "../../datasets/deepGlobe Land Cover Classification Dataset/total_dataset/image"
 train_mask_dir = "../../datasets/deepGlobe Land Cover Classification Dataset/total_dataset/label-mask"
 
-output_dir = "./segformer_improved_unfreezed_encoder_updated"
+output_dir = "./segformer_river_focus"
 os.makedirs(output_dir, exist_ok=True)
 checkpoint_dir = os.path.join(output_dir, "checkpoints")
 os.makedirs(checkpoint_dir, exist_ok=True)
@@ -57,12 +58,12 @@ class SegDataset(Dataset):
             augmented = self.transforms(image=img, mask=mask)
             img, mask = augmented["image"], augmented["mask"]
 
-        encoded = self.feature_extractor(images=img, return_tensors="pt")
+        encoded = feature_extractor(images=img, return_tensors="pt")
         pixel_values = encoded["pixel_values"].squeeze()
         return pixel_values, mask.clone().long()
 
 # ==============================
-# AUGMENTATIONS (moderate)
+# AUGMENTATIONS
 # ==============================
 train_tf = A.Compose([
     A.HorizontalFlip(p=0.5),
@@ -121,30 +122,56 @@ for fold, (train_idx, val_idx) in enumerate(kf.split(all_indices), 1):
     # Dataloaders
     train_subset = Subset(dataset, train_idx)
     val_subset = Subset(dataset, val_idx)
-    train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True, num_workers=2)
+
+    # ==============================
+    # OVERSAMPLING RIVER IMAGES
+    # ==============================
+    sample_weights = []
+    for idx in train_idx:
+        mask = np.array(Image.open(os.path.join(train_mask_dir, dataset.masks[idx])))
+        if (mask == river_class_index).sum() > 0:
+            sample_weights.append(5.0)  # higher weight for river images
+        else:
+            sample_weights.append(1.0)
+
+    sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
+    train_loader = DataLoader(train_subset, batch_size=batch_size, sampler=sampler, num_workers=2)
     val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False, num_workers=2)
 
-    # Model
+    # ==============================
+    # MODEL
+    # ==============================
     model = SegformerForSemanticSegmentation.from_pretrained(
         "nvidia/segformer-b2-finetuned-ade-512-512",
         num_labels=num_classes,
         ignore_mismatched_sizes=True
     ).to(device)
 
-    # Gradual unfreeze: freeze all encoder first
+    # Gradual unfreeze
     for param in model.segformer.encoder.parameters():
         param.requires_grad = False
 
-    # Add decoder dropout
     if hasattr(model.decode_head, 'dropout'):
         model.decode_head.dropout = torch.nn.Dropout2d(p=0.2)
 
+    # ==============================
+    # CLASS WEIGHTING
+    # ==============================
+    # Compute rough class weights from training masks
+    class_pixel_counts = np.zeros(num_classes)
+    for idx in train_idx:
+        mask = np.array(Image.open(os.path.join(train_mask_dir, dataset.masks[idx])))
+        for cls in range(num_classes):
+            class_pixel_counts[cls] += (mask == cls).sum()
+    class_weights = 1.0 / (class_pixel_counts + 1e-6)
+    class_weights = class_weights / class_weights.sum() * num_classes
+    class_weights = torch.tensor(class_weights, dtype=torch.float).to(device)
+    criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
-    criterion = torch.nn.CrossEntropyLoss()  # no label smoothing initially
     scaler = torch.cuda.amp.GradScaler()
 
-    # WandB
-    wandb.init(project="segformer-kfold-improved-updated", name=f"fold_{fold}", reinit=True)
+    wandb.init(project="segformer_river_focus", name=f"fold_{fold}", reinit=True)
     wandb.config.update({
         "fold": fold,
         "num_classes": num_classes,
@@ -172,13 +199,11 @@ for fold, (train_idx, val_idx) in enumerate(kf.split(all_indices), 1):
 
         for step, (imgs, masks) in enumerate(tqdm(train_loader, desc=f"Training Fold {fold} Epoch {epoch+1}")):
             imgs, masks = imgs.to(device), masks.to(device)
-
             with torch.cuda.amp.autocast():
                 outputs = model(pixel_values=imgs, labels=masks)
                 loss = outputs.loss / accumulation_steps
 
             scaler.scale(loss).backward()
-
             if (step + 1) % accumulation_steps == 0 or (step + 1) == len(train_loader):
                 scaler.step(optimizer)
                 scaler.update()
