@@ -1,5 +1,4 @@
 /venv
-/datasets
 /src/finetuning_segformer/segformer_logs
 /src/finetuning_segformer/segformer_logs_kfold
 /src/finetuning_segformer/wandb
@@ -8,3 +7,4 @@
 /src/finetuning_segformer/segformer_improved_unfreezed_ encoder
 /src/finetuning_segformer/segformer_improved_unfreezed_encoder_updated
 /src/finetuning_segformer/segformer_river_focus
+/dataset
