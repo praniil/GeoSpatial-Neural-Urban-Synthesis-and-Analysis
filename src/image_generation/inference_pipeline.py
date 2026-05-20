@@ -4,9 +4,10 @@ import os
 from pathlib import Path
 from typing import Optional
 
+import cv2
 import numpy as np
 from PIL import Image
-from .utils import ensure_dir, mask_to_color_image, rgb_mask_to_index
+from .utils import ensure_dir, mask_to_color_image, bgr_mask_to_index
 from .area_calculator import calculate_area_percentages
 from .prompt_builder import generate_base_prompt, build_final_prompt
 
@@ -61,8 +62,11 @@ def process_dataset(dataset_dir: str, output_dir: str, hf_repo: str, device: str
             if not os.path.exists(mask_path):
                 print(f"Missing mask for {name}: {mask_path}")
                 continue
-            mask_rgb = Image.open(mask_path).convert("RGB")
-            pred_mask = rgb_mask_to_index(np.array(mask_rgb))
+            mask_bgr = cv2.imread(mask_path, cv2.IMREAD_COLOR)
+            if mask_bgr is None:
+                print(f"Failed to read mask: {mask_path}")
+                continue
+            pred_mask = bgr_mask_to_index(mask_bgr)
             mask_out = mask_path
         else:
             _, pred_mask = segment_image(img_path, model, processor, device)

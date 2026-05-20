@@ -31,7 +31,7 @@ with torch.no_grad():
 # PREDICT MASK
 pred_mask = torch.argmax(logits, dim=1).squeeze().cpu().numpy()
 
-# COLOR MAP (BGR-style values used as RGB here)
+# COLOR MAP (authored in BGR, convert to RGB for matplotlib/PIL)
 colors = np.array([
     [0,   0,   0],     # Background
     [128, 0,   0],     # Residential
@@ -41,6 +41,7 @@ colors = np.array([
     [128, 128, 0],     # Unused land
     [128, 0,   128],   # Agriculture
 ], dtype=np.uint8)
+colors = colors[:, ::-1]
 
 # CREATE SEGMENTATION IMAGE
 seg_image = colors[pred_mask]

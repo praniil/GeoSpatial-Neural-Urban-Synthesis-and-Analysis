@@ -2,6 +2,7 @@ import argparse
 import os
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
 from PIL import Image
@@ -12,9 +13,14 @@ from diffusers import (
     UniPCMultistepScheduler,
 )
 
-from .area_calculator import calculate_area_percentages
+from .area_calculator import calculate_area_percentages, CLASSES
 from .prompt_builder import generate_base_prompt, build_final_prompt
-from .utils import mask_to_color_image, rgb_mask_to_index
+from .utils import (
+    blend_preserved_regions,
+    build_preserve_alpha,
+    bgr_mask_to_index,
+    mask_to_color_image,
+)
 
 
 DEFAULT_HF_REPO = "Pranilllllll/segformer-satellite-segementation"
@@ -39,14 +45,34 @@ def segment_image(image_path: str, model, processor, device: str):
 
 
 def load_mask(mask_path: str) -> np.ndarray:
-    mask_rgb = np.array(Image.open(mask_path).convert("RGB"))
-    return rgb_mask_to_index(mask_rgb)
+    mask_bgr = cv2.imread(mask_path, cv2.IMREAD_COLOR)
+    if mask_bgr is None:
+        raise FileNotFoundError(f"Failed to read mask: {mask_path}")
+    return bgr_mask_to_index(mask_bgr)
+
+
+def parse_preserve_classes(value: str) -> list[int]:
+    if not value:
+        return []
+    name_to_index = {name.lower(): idx for idx, name in CLASSES.items()}
+    tokens = [token.strip() for token in value.split(",") if token.strip()]
+    indices: list[int] = []
+    for token in tokens:
+        if token.isdigit():
+            idx = int(token)
+        else:
+            key = token.lower()
+            if key not in name_to_index:
+                raise ValueError(f"Unknown class name in preserve list: {token}")
+            idx = name_to_index[key]
+        indices.append(idx)
+    return sorted(set(indices))
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--image", required=True, help="Input satellite image path")
-    p.add_argument("--mask", default="", help="Optional RGB mask path; if empty, SegFormer will run")
+    p.add_argument("--mask", default="", help="Optional BGR mask path; if empty, SegFormer will run")
     p.add_argument("--controlnet_path", required=True, help="Path to ControlNet checkpoint")
     p.add_argument("--base_model", default=DEFAULT_BASE_MODEL, help="Base SD model when loading .safetensors")
     p.add_argument("--hf_repo", default=DEFAULT_HF_REPO, help="SegFormer HF repo or local path")
@@ -58,6 +84,17 @@ def main():
     p.add_argument("--guidance_scale", type=float, default=7.5)
     p.add_argument("--controlnet_scale", type=float, default=1.0)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--preserve_classes",
+        default="forest,river,road",
+        help="Comma-separated class names or indices to preserve (empty to disable)",
+    )
+    p.add_argument(
+        "--preserve_feather",
+        type=int,
+        default=4,
+        help="Feather radius in pixels for preserve mask (0=hard edges)",
+    )
     args = p.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -116,6 +153,15 @@ def main():
     )
 
     output_image = output.images[0]
+    preserve_indices = parse_preserve_classes(args.preserve_classes)
+    if preserve_indices:
+        alpha = build_preserve_alpha(
+            pred_mask,
+            preserve_indices,
+            feather_radius=args.preserve_feather,
+            out_size=output_image.size,
+        )
+        output_image = blend_preserved_regions(original_image, output_image, alpha)
     output_image.save(os.path.join(args.output_dir, "output_generated.png"))
     control_image.save(os.path.join(args.output_dir, "output_mask.png"))
     original_image.save(os.path.join(args.output_dir, "output_original.png"))

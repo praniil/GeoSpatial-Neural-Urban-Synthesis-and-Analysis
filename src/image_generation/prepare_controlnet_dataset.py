@@ -3,32 +3,20 @@ import json
 import os
 from pathlib import Path
 
-from PIL import Image
+import cv2
+import numpy as np
 
 from .area_calculator import CLASSES
 from .prompt_builder import generate_base_prompt, build_final_prompt
-from .utils import COLOR_TO_INDEX
+from .utils import bgr_mask_to_index
 
 
-def area_stats_from_mask(mask_img: Image.Image) -> dict:
-    """Compute area stats directly from mask colors (fast, avoids per-pixel loops)."""
-    w, h = mask_img.size
-    total = w * h
-    maxcolors = total
-    colors = mask_img.getcolors(maxcolors=maxcolors)
-    if colors is None:
-        raise ValueError("Mask has too many colors; expected a small fixed palette.")
-
-    counts_by_idx = {idx: 0 for idx in CLASSES.keys()}
-    for count, color in colors:
-        key = (int(color[0]), int(color[1]), int(color[2]))
-        if key not in COLOR_TO_INDEX:
-            raise ValueError(f"Unknown mask color: {key}")
-        counts_by_idx[COLOR_TO_INDEX[key]] += int(count)
-
+def area_stats_from_label_mask(label_mask: np.ndarray) -> dict:
+    """Compute area stats directly from label IDs."""
+    total = label_mask.size
     stats = {}
     for idx, name in CLASSES.items():
-        count = counts_by_idx.get(idx, 0)
+        count = int((label_mask == idx).sum())
         pct = round(float(count) / float(total) * 100.0, 2)
         stats[idx] = {"name": name, "percentage": pct, "pixel_count": count}
 
@@ -52,8 +40,11 @@ def build_metadata(dataset_dir: str, output_jsonl: str, custom_prompt: str = "",
             print(f"Skipping {name}: missing mask {mask_path}")
             continue
 
-        mask_img = Image.open(mask_path).convert("RGB")
-        area_stats = area_stats_from_mask(mask_img)
+        mask_bgr = cv2.imread(str(mask_path), cv2.IMREAD_COLOR)
+        if mask_bgr is None:
+            raise FileNotFoundError(f"Failed to read mask: {mask_path}")
+        label_mask = bgr_mask_to_index(mask_bgr)
+        area_stats = area_stats_from_label_mask(label_mask)
         base_prompt = generate_base_prompt(area_stats)
         final_prompt = build_final_prompt(base_prompt, custom_prompt, strategy)
 
