@@ -1,2 +1,9 @@
 /venv
 /dataset
+diffusers.zip
+kaggle_metadata.jsonl
+*.md
+/outputs
+/src/image_generation/__pycache__
+/trained_model
+/diffusers
