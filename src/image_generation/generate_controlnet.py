@@ -80,7 +80,7 @@ def main():
     p.add_argument("--custom_prompt", default="")
     p.add_argument("--strategy", choices=["append", "override"], default="append")
     p.add_argument("--negative_prompt", default="blurry, low quality, distorted, cartoon, painting")
-    p.add_argument("--num_steps", type=int, default=30)
+    p.add_argument("--num_steps", type=int, default=70)
     p.add_argument("--guidance_scale", type=float, default=7.5)
     p.add_argument("--controlnet_scale", type=float, default=1.0)
     p.add_argument("--seed", type=int, default=42)
