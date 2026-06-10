@@ -11,6 +11,12 @@ from .prompt_builder import generate_base_prompt, build_final_prompt
 from .utils import bgr_mask_to_index
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+IMAGES_DIR = PROJECT_ROOT / "dataset" / "controlnet-images"
+MASKS_DIR = PROJECT_ROOT / "dataset" / "controlnet-masks"
+OUTPUT_JSONL = PROJECT_ROOT / "dataset" / "metadata-controlnet.jsonl"
+
+
 def area_stats_from_label_mask(label_mask: np.ndarray) -> dict:
     """Compute area stats directly from label IDs."""
     total = label_mask.size
@@ -24,10 +30,10 @@ def area_stats_from_label_mask(label_mask: np.ndarray) -> dict:
     return stats
 
 
-def build_metadata(dataset_dir: str, output_jsonl: str, custom_prompt: str = "", strategy: str = "append"):
-    images_dir = os.path.join(dataset_dir, "images")
-    masks_dir = os.path.join(dataset_dir, "masks")
-
+def build_metadata(custom_prompt: str = "", strategy: str = "append"):
+    images_dir = IMAGES_DIR
+    masks_dir = MASKS_DIR
+    output_jsonl = OUTPUT_JSONL
     image_paths = sorted([p for p in Path(images_dir).glob("**/*") if p.suffix.lower() in [".png", ".jpg", ".jpeg"]])
     if not image_paths:
         raise FileNotFoundError(f"No images found in {images_dir}")
@@ -49,8 +55,8 @@ def build_metadata(dataset_dir: str, output_jsonl: str, custom_prompt: str = "",
         final_prompt = build_final_prompt(base_prompt, custom_prompt, strategy)
 
         # Use relative paths so datasets/imagefolder can resolve files under --train_data_dir.
-        rel_image = os.path.relpath(img_path, dataset_dir)
-        rel_mask = os.path.relpath(mask_path, dataset_dir)
+        rel_image = os.path.relpath(img_path, PROJECT_ROOT)
+        rel_mask = os.path.relpath(mask_path, PROJECT_ROOT)
         entries.append({
             "file_name": rel_image,
             "conditioning_image_file_name": rel_mask,
@@ -60,7 +66,7 @@ def build_metadata(dataset_dir: str, output_jsonl: str, custom_prompt: str = "",
     if not entries:
         raise RuntimeError("No image/mask pairs found to write JSONL.")
 
-    os.makedirs(os.path.dirname(output_jsonl) or ".", exist_ok=True)
+    os.makedirs(output_jsonl.parent, exist_ok=True)
     with open(output_jsonl, "w") as f:
         for entry in entries:
             f.write(json.dumps(entry) + "\n")
@@ -70,13 +76,11 @@ def build_metadata(dataset_dir: str, output_jsonl: str, custom_prompt: str = "",
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--dataset_dir", default="dataset", help="Dataset dir with images/ and masks/")
-    p.add_argument("--output_jsonl", default="dataset/metadata.jsonl", help="Output JSONL path")
     p.add_argument("--custom_prompt", default="", help="Optional prompt to append/override")
     p.add_argument("--strategy", choices=["append", "override"], default="append")
     args = p.parse_args()
 
-    build_metadata(args.dataset_dir, args.output_jsonl, args.custom_prompt, args.strategy)
+    build_metadata(args.custom_prompt, args.strategy)
 
 
 if __name__ == "__main__":
