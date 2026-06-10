@@ -7,3 +7,4 @@ kaggle_metadata.jsonl
 /src/image_generation/__pycache__
 /trained_model
 /diffusers
+kaggle-metadata-controlnet.jsonl
