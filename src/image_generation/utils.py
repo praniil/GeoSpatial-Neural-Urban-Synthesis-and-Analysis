@@ -2,7 +2,7 @@ import os
 from typing import Tuple
 
 import numpy as np
-from PIL import Image, ImageFilter
+from PIL import Image, ImageChops, ImageFilter
 
 # Canonical mask colors are defined in BGR (OpenCV source of truth).
 CLASS_COLORS_BGR = np.array([
@@ -124,6 +124,13 @@ def build_preserve_alpha(
         alpha = alpha.filter(ImageFilter.GaussianBlur(radius=feather_radius))
 
     return alpha
+
+
+def build_inpaint_edit_mask(preserve_alpha: Image.Image) -> Image.Image:
+    """Build an inpaint mask where white pixels may change and black pixels stay fixed."""
+    if preserve_alpha.mode != "L":
+        preserve_alpha = preserve_alpha.convert("L")
+    return ImageChops.invert(preserve_alpha)
 
 
 def blend_preserved_regions(

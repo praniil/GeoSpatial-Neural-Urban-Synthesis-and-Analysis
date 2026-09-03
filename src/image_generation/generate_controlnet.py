@@ -8,6 +8,7 @@ import torch
 from PIL import Image
 from diffusers import (
     ControlNetModel,
+    StableDiffusionControlNetInpaintPipeline,
     StableDiffusionControlNetPipeline,
     StableDiffusionPipeline,
     UniPCMultistepScheduler,
@@ -17,6 +18,7 @@ from .area_calculator import calculate_area_percentages, CLASSES
 from .prompt_builder import generate_base_prompt, build_final_prompt
 from .utils import (
     blend_preserved_regions,
+    build_inpaint_edit_mask,
     build_preserve_alpha,
     bgr_mask_to_index,
     mask_to_color_image,
@@ -60,6 +62,8 @@ def parse_preserve_classes(value: str) -> list[int]:
     for token in tokens:
         if token.isdigit():
             idx = int(token)
+            if idx not in CLASSES:
+                raise ValueError(f"Unknown class index in preserve list: {token}")
         else:
             key = token.lower()
             if key not in name_to_index:
@@ -95,6 +99,18 @@ def main():
         default=4,
         help="Feather radius in pixels for preserve mask (0=hard edges)",
     )
+    p.add_argument(
+        "--preserve_mode",
+        choices=["inpaint", "composite"],
+        default="inpaint",
+        help="Preserve selected classes during denoising, or composite them after generation",
+    )
+    p.add_argument(
+        "--inpaint_strength",
+        type=float,
+        default=1.0,
+        help="Denoising strength for mutable regions when --preserve_mode=inpaint",
+    )
     args = p.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -112,6 +128,17 @@ def main():
     final_prompt = build_final_prompt(base_prompt, args.custom_prompt, args.strategy)
 
     control_image = mask_to_color_image(pred_mask, size=(512, 512))
+    preserve_indices = parse_preserve_classes(args.preserve_classes)
+    preserve_alpha = None
+    inpaint_mask = None
+    if preserve_indices:
+        preserve_alpha = build_preserve_alpha(
+            pred_mask,
+            preserve_indices,
+            feather_radius=args.preserve_feather,
+            out_size=control_image.size,
+        )
+        inpaint_mask = build_inpaint_edit_mask(preserve_alpha)
 
     controlnet_path = Path(args.controlnet_path)
     dtype = torch.float16 if device == "cuda" else torch.float32
@@ -133,41 +160,66 @@ def main():
             torch_dtype=dtype,
         )
         controlnet = controlnet.to(dtype)
-    pipe = StableDiffusionControlNetPipeline.from_pretrained(
-        "runwayml/stable-diffusion-v1-5",
-        controlnet=controlnet,
-        torch_dtype=dtype,
-        safety_checker=None,
-    ).to(device)
+
+    if preserve_indices and args.preserve_mode == "inpaint":
+        pipe = StableDiffusionControlNetInpaintPipeline.from_pretrained(
+            args.base_model,
+            controlnet=controlnet,
+            torch_dtype=dtype,
+            safety_checker=None,
+        ).to(device)
+    else:
+        pipe = StableDiffusionControlNetPipeline.from_pretrained(
+            args.base_model,
+            controlnet=controlnet,
+            torch_dtype=dtype,
+            safety_checker=None,
+        ).to(device)
     pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
 
     generator = torch.Generator(device=device).manual_seed(args.seed)
-    output = pipe(
-        prompt=final_prompt,
-        negative_prompt=args.negative_prompt,
-        image=control_image,
-        num_inference_steps=args.num_steps,
-        guidance_scale=args.guidance_scale,
-        controlnet_conditioning_scale=args.controlnet_scale,
-        generator=generator,
-    )
+    if preserve_indices and args.preserve_mode == "inpaint":
+        output = pipe(
+            prompt=final_prompt,
+            negative_prompt=args.negative_prompt,
+            image=original_image,
+            mask_image=inpaint_mask,
+            control_image=control_image,
+            strength=args.inpaint_strength,
+            num_inference_steps=args.num_steps,
+            guidance_scale=args.guidance_scale,
+            controlnet_conditioning_scale=args.controlnet_scale,
+            generator=generator,
+        )
+    else:
+        output = pipe(
+            prompt=final_prompt,
+            negative_prompt=args.negative_prompt,
+            image=control_image,
+            num_inference_steps=args.num_steps,
+            guidance_scale=args.guidance_scale,
+            controlnet_conditioning_scale=args.controlnet_scale,
+            generator=generator,
+        )
 
     output_image = output.images[0]
-    preserve_indices = parse_preserve_classes(args.preserve_classes)
-    if preserve_indices:
-        alpha = build_preserve_alpha(
-            pred_mask,
-            preserve_indices,
-            feather_radius=args.preserve_feather,
-            out_size=output_image.size,
-        )
-        output_image = blend_preserved_regions(original_image, output_image, alpha)
+    if preserve_indices and args.preserve_mode == "composite":
+        if preserve_alpha.size != output_image.size:
+            preserve_alpha = preserve_alpha.resize(output_image.size, resample=Image.NEAREST)
+        output_image = blend_preserved_regions(original_image, output_image, preserve_alpha)
     output_image.save(os.path.join(args.output_dir, "output_generated.png"))
     control_image.save(os.path.join(args.output_dir, "output_mask.png"))
     original_image.save(os.path.join(args.output_dir, "output_original.png"))
+    if preserve_alpha is not None:
+        preserve_alpha.save(os.path.join(args.output_dir, "output_preserve_mask.png"))
+    if inpaint_mask is not None:
+        inpaint_mask.save(os.path.join(args.output_dir, "output_edit_mask.png"))
 
     print("Base prompt:", base_prompt)
     print("Final prompt:", final_prompt)
+    if preserve_indices:
+        preserved = ", ".join(CLASSES[idx] for idx in preserve_indices)
+        print(f"Preserved classes ({args.preserve_mode}): {preserved}")
     print("Saved outputs to", args.output_dir)
 
 
